@@ -33,6 +33,7 @@ export class AccountManager {
     this.config = config;
     this.loadSettings();
     this.reloadAccounts();
+    this.syncOAuthToOmp();
     this.startBackgroundPoller();
   }
 
@@ -72,6 +73,12 @@ export class AccountManager {
     } catch {}
   }
 
+  private onPeriodicPoll?: () => Promise<void>;
+
+  public setOnPeriodicPoll(fn: () => Promise<void>) {
+    this.onPeriodicPoll = fn;
+  }
+
   public startBackgroundPoller() {
     if (this.pollerTimer) {
       clearInterval(this.pollerTimer);
@@ -80,9 +87,13 @@ export class AccountManager {
     const intervalMs = Math.max(15, this.settings.pollIntervalSec) * 1000;
     this.pollerTimer = setInterval(() => {
       this.syncAllQuotas(true).catch(() => {});
+      this.onPeriodicPoll?.().catch(() => {});
     }, intervalMs);
+    // Ensure timer does not hold short-lived processes (e.g. omp models) open
+    if (typeof this.pollerTimer.unref === "function") {
+      this.pollerTimer.unref();
+    }
   }
-
   public stopBackgroundPoller() {
     if (this.pollerTimer) {
       clearInterval(this.pollerTimer);
@@ -523,6 +534,66 @@ export class AccountManager {
     const data = (await res.json()) as { access_token: string; expires_in: number };
     account.accessToken = data.access_token;
     account.expiresAt = Date.now() + data.expires_in * 1000;
+    this.syncOAuthToOmp(account);
     return data.access_token;
+  }
+
+  public syncOAuthToOmp(acc?: AntigravityAccount) {
+    const target = acc || this.accounts.find(a => a.isActive && !a.rateLimitedUntil) || this.accounts[0];
+    if (!target || !target.accessToken) return;
+
+    try {
+      const dataPayload = JSON.stringify({
+        access: target.accessToken,
+        refresh: target.refreshToken || "",
+        expires: typeof target.expiresAt === "number" ? target.expiresAt : Date.now() + 3600 * 1000,
+        projectId: target.projectId || "aicode-consumers",
+        email: target.email
+      });
+
+      // 1. Sync to agent.db auth_credentials table
+      const agentDbPath = path.join(os.homedir(), ".omp", "agent", "agent.db");
+      if (fs.existsSync(agentDbPath)) {
+        try {
+          const db = new Database(agentDbPath);
+          const now = Math.floor(Date.now() / 1000);
+          const existing = db.query("SELECT id FROM auth_credentials WHERE provider = 'google-antigravity'").get() as { id: number } | null;
+          if (existing) {
+            db.run("UPDATE auth_credentials SET data = ?, updated_at = ? WHERE provider = 'google-antigravity'", [dataPayload, now]);
+          } else {
+            db.run(
+              "INSERT INTO auth_credentials (provider, credential_type, data, created_at, updated_at) VALUES ('google-antigravity', 'oauth', ?, ?, ?)",
+              [dataPayload, now, now]
+            );
+          }
+        } catch {}
+      }
+
+      // 2. Sync to auth.json in ~/.omp/agent/auth.json and ~/.pi/agent/auth.json
+      for (const authPath of [
+        path.join(os.homedir(), ".omp", "agent", "auth.json"),
+        path.join(os.homedir(), ".pi", "agent", "auth.json")
+      ]) {
+        try {
+          const dir = path.dirname(authPath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          let obj: Record<string, unknown> = {};
+          if (fs.existsSync(authPath)) {
+            try {
+              obj = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+            } catch {}
+          }
+          obj["google-antigravity"] = {
+            type: "oauth",
+            access: target.accessToken,
+            refresh: target.refreshToken || "",
+            expires: target.expiresAt,
+            projectId: target.projectId || "aicode-consumers",
+            email: target.email
+          };
+          fs.writeFileSync(authPath, JSON.stringify(obj, null, 2), "utf-8");
+        } catch {}
+      }
+    } catch {}
   }
 }

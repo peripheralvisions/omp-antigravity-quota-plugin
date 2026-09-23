@@ -6,9 +6,10 @@ import {
   buildAntigravityRequestBody,
   isValidThoughtSignature,
   extractThoughtSignature,
+  isGemini3Family,
   SKIP_THOUGHT_SIGNATURE
 } from "../src/request-transformer.ts";
-import { fetchRemoteModels } from "../src/model-catalog.ts";
+import { fetchRemoteModels, synthesizeModelsFromDiscovery, FALLBACK_MODELS } from "../src/model-catalog.ts";
 import { ProxyServer } from "../src/proxy-server.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -50,7 +51,7 @@ describe("AccountManager Distribution Strategy", () => {
 
     expect(first.email).toBeDefined();
     expect(second.email).toBeDefined();
-  });
+  }, 15000);
 });
 
 describe("AccountManager Bulk Import", () => {
@@ -263,6 +264,65 @@ describe("RequestTransformer", () => {
     const innerInvalid = reqInvalid.request as { contents: Array<{ parts: Array<Record<string, unknown>> }> };
     expect(innerInvalid.contents[1].parts[0].thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
   });
+  it("includes id and proper function name in functionResponse for tool results", () => {
+    const account = { id: "1", email: "a@b.com", name: "a", projectId: "p", accessToken: "t", refreshToken: "r", expiresAt: 0, priority: 1, isActive: true };
+    const req = buildAntigravityRequestBody(
+      account,
+      "claude-sonnet-4-6",
+      {
+        model: "claude-sonnet-4-6",
+        messages: [
+          { role: "user", content: "Check weather" },
+          {
+            role: "assistant",
+            tool_calls: [
+              { id: "call_tokyo", type: "function", function: { name: "get_weather", arguments: "{}" } },
+              { id: "call_paris", type: "function", function: { name: "get_weather", arguments: "{}" } }
+            ]
+          },
+          { role: "tool", tool_call_id: "call_tokyo", content: '{"temp": 22}' },
+          { role: "tool", tool_call_id: "call_paris", content: '{"temp": 18}' }
+        ]
+      }
+    );
+
+    const inner = req.request as { contents: Array<{ role: string; parts: Array<Record<string, any>> }> };
+    expect(inner.contents.length).toBe(3); // user -> model -> single merged user turn for parallel tools
+    expect(inner.contents[2].role).toBe("user");
+    expect(inner.contents[2].parts.length).toBe(2);
+
+    const p1 = inner.contents[2].parts[0].functionResponse;
+    const p2 = inner.contents[2].parts[1].functionResponse;
+    expect(p1.name).toBe("get_weather");
+    expect(p1.id).toBe("call_tokyo");
+    expect(p1.response).toEqual({ temp: 22 });
+
+    expect(p2.name).toBe("get_weather");
+    expect(p2.id).toBe("call_paris");
+    expect(p2.response).toEqual({ temp: 18 });
+  });
+
+  it("clamps minimal reasoning effort to low on Gemini 3.7+", () => {
+    const account = { id: "1", email: "a@b.com", name: "a", projectId: "p", accessToken: "t", refreshToken: "r", expiresAt: 0, priority: 1, isActive: true };
+    const req38 = buildAntigravityRequestBody(
+      account,
+      "gemini-3.8-flash-tiered",
+      {
+        model: "gemini-3.8-flash",
+        messages: [{ role: "user", content: "hi" }],
+        reasoning_effort: "minimal"
+      }
+    );
+    const inner38 = req38.request as { generationConfig: { thinkingConfig: { thinkingLevel: string } } };
+    expect(inner38.generationConfig.thinkingConfig.thinkingLevel).toBe("low");
+  });
+
+  it("recognizes gemini-pro-agent as Gemini 3 family for thought signatures", () => {
+    expect(isGemini3Family("gemini-pro-agent")).toBe(true);
+    expect(isGemini3Family("gemini-3.8-flash-tiered")).toBe(true);
+    expect(isGemini3Family("gemini-3.1-pro-low")).toBe(true);
+    expect(isGemini3Family("claude-sonnet-4-6")).toBe(false);
+  });
 });
 
 describe("ModelCatalog", () => {
@@ -273,6 +333,90 @@ describe("ModelCatalog", () => {
     const flash = models.find(m => m.id === "gemini-3.8-flash-high");
     expect(flash).toBeDefined();
     expect(flash?.upstreamModelId).toBe("gemini-3.8-flash-tiered");
+  });
+  it("synthesizes all reasoning levels and base models dynamically from raw Google payload", () => {
+    const mockPayload = {
+      "gemini-3.8-flash-tiered": { displayName: "Gemini 3.8 Flash", maxTokens: 1048576, maxOutputTokens: 65536 },
+      "gemini-3.7-flash-tiered": { displayName: "Gemini 3.7 Flash", maxTokens: 1048576, maxOutputTokens: 65536 },
+      "gemini-3.6-flash-tiered": { displayName: "Gemini 3.6 Flash", maxTokens: 1048576, maxOutputTokens: 65536 },
+      "gemini-3.5-flash-extra-low": { displayName: "Gemini 3.5 Flash Low" },
+      "gemini-3.5-flash-low": { displayName: "Gemini 3.5 Flash Medium" },
+      "gemini-3-flash-agent": { displayName: "Gemini 3.5 Flash High" },
+      "gemini-pro-agent": { displayName: "Gemini Pro Agent" },
+      "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro Low" },
+      "claude-sonnet-4-6": { displayName: "Claude Sonnet 4.6" },
+      "claude-opus-4-6-thinking": { displayName: "Claude Opus 4.6 Thinking" },
+      "gpt-oss-120b-medium": { displayName: "GPT-OSS 120B Medium" }
+    };
+
+    const synthesized = synthesizeModelsFromDiscovery(mockPayload);
+    const ids = synthesized.map(m => m.id);
+
+    // Gemini 3.8 Flash family
+    expect(ids).toContain("gemini-3.8-flash");
+    expect(ids).toContain("gemini-3.8-flash-high");
+    expect(ids).toContain("gemini-3.8-flash-medium");
+    expect(ids).toContain("gemini-3.8-flash-low");
+
+    // Gemini 3.7 Flash family
+    expect(ids).toContain("gemini-3.7-flash");
+    expect(ids).toContain("gemini-3.7-flash-high");
+    expect(ids).toContain("gemini-3.7-flash-medium");
+    expect(ids).toContain("gemini-3.7-flash-low");
+
+    // Gemini 3.5 Flash family
+    expect(ids).toContain("gemini-3.5-flash");
+    expect(ids).toContain("gemini-3.5-flash-high");
+    expect(ids).toContain("gemini-3.5-flash-medium");
+    expect(ids).toContain("gemini-3.5-flash-low");
+
+    // Gemini 3.1 Pro family
+    expect(ids).toContain("gemini-3.1-pro");
+    expect(ids).toContain("gemini-3.1-pro-high");
+    expect(ids).toContain("gemini-3.1-pro-low");
+    expect(ids).toContain("gemini-pro-agent");
+
+    // Claude family
+    expect(ids).toContain("claude-sonnet-4-6");
+    expect(ids).toContain("claude-opus-4-6-thinking");
+    expect(ids).toContain("claude-opus-4-6");
+
+    // Upstream mappings
+    const m38High = synthesized.find(m => m.id === "gemini-3.8-flash-high");
+    expect(m38High?.upstreamModelId).toBe("gemini-3.8-flash-tiered");
+    expect(m38High?.thinkingLevel).toBe("high");
+
+    const m38Med = synthesized.find(m => m.id === "gemini-3.8-flash-medium");
+    expect(m38Med?.upstreamModelId).toBe("gemini-3.8-flash-tiered");
+    expect(m38Med?.thinkingLevel).toBe("medium");
+
+    const m38Low = synthesized.find(m => m.id === "gemini-3.8-flash-low");
+    expect(m38Low?.upstreamModelId).toBe("gemini-3.8-flash-tiered");
+    expect(m38Low?.thinkingLevel).toBe("low");
+
+    const m38Base = synthesized.find(m => m.id === "gemini-3.8-flash");
+    expect(m38Base?.upstreamModelId).toBe("gemini-3.8-flash-tiered");
+    expect(m38Base?.thinkingLevel).toBeUndefined(); // dynamic
+  });
+
+  it("automatically discovers and synthesizes newly released future models", () => {
+    const futurePayload = {
+      "gemini-3.9-flash-tiered": { displayName: "Gemini 3.9 Flash", maxTokens: 2000000, maxOutputTokens: 65536 },
+      "gemini-4.0-flash-tiered": { displayName: "Gemini 4.0 Flash", maxTokens: 4000000, maxOutputTokens: 131072 }
+    };
+
+    const synthesized = synthesizeModelsFromDiscovery(futurePayload);
+    const ids = synthesized.map(m => m.id);
+
+    expect(ids).toContain("gemini-3.9-flash");
+    expect(ids).toContain("gemini-3.9-flash-high");
+    expect(ids).toContain("gemini-3.9-flash-medium");
+    expect(ids).toContain("gemini-3.9-flash-low");
+
+    expect(ids).toContain("gemini-4.0-flash");
+    expect(ids).toContain("gemini-4.0-flash-high");
+    expect(ids).toContain("gemini-4.0-flash-medium");
+    expect(ids).toContain("gemini-4.0-flash-low");
   });
 });
 

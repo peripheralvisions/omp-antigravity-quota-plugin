@@ -65,6 +65,16 @@ export function isValidThoughtSignature(signature: unknown): signature is string
   return base64SignaturePattern.test(trimmed);
 }
 
+export function isGemini3Family(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  return (
+    lower.includes("gemini-3") ||
+    lower.includes("gemini-pro-agent") ||
+    lower.includes("gemini-pro") ||
+    lower.startsWith("gemini-3")
+  );
+}
+
 export function extractThoughtSignature(
   tc: NonNullable<OpenAIMessage["tool_calls"]>[number],
   msg?: OpenAIMessage
@@ -117,11 +127,13 @@ export function extractThoughtSignature(
 
   return undefined;
 }
+
 export function buildAntigravityRequestBody(
   account: AntigravityAccount,
   upstreamModelId: string,
   request: OpenAIChatRequest,
-  thinkingOverride?: { thinkingLevel?: string; thinkingBudget?: number }
+  thinkingOverride?: { thinkingLevel?: string; thinkingBudget?: number },
+  signatureLookup?: (callId: string) => string | undefined
 ): Record<string, unknown> {
   const contents: Array<{
     role: "user" | "model";
@@ -129,6 +141,18 @@ export function buildAntigravityRequestBody(
   }> = [];
 
   let systemInstructionText = "";
+
+  // Map tool_call_id to function name so tool response messages have the proper tool name
+  const toolNameMap = new Map<string, string>();
+  for (const msg of request.messages) {
+    if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (tc.id && tc.function?.name) {
+          toolNameMap.set(tc.id, tc.function.name);
+        }
+      }
+    }
+  }
 
   for (const msg of request.messages) {
     if (msg.role === "system") {
@@ -187,10 +211,10 @@ export function buildAntigravityRequestBody(
           };
 
           // Google CCA requires thought_signature for replayed function calls on Gemini 3+
-          const sig = extractThoughtSignature(tc, msg);
+          const sig = extractThoughtSignature(tc, msg) || (tc.id ? signatureLookup?.(tc.id) : undefined);
           if (sig) {
             part.thoughtSignature = sig;
-          } else if (upstreamModelId.includes("gemini-3")) {
+          } else if (isGemini3Family(upstreamModelId)) {
             part.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
           }
 
@@ -204,22 +228,34 @@ export function buildAntigravityRequestBody(
     } else if (msg.role === "tool") {
       let parsedOutput: unknown;
       try {
-        parsedOutput = JSON.parse(typeof msg.content === "string" ? msg.content : "{}");
+        parsedOutput = typeof msg.content === "string" ? JSON.parse(msg.content) : msg.content;
       } catch {
         parsedOutput = { result: msg.content };
       }
+      if (typeof parsedOutput !== "object" || parsedOutput === null) {
+        parsedOutput = { result: parsedOutput };
+      }
 
-      contents.push({
-        role: "user",
-        parts: [
-          {
-            functionResponse: {
-              name: msg.tool_call_id || "tool_result",
-              response: typeof parsedOutput === "object" && parsedOutput !== null ? parsedOutput : { result: parsedOutput }
-            }
-          }
-        ]
-      });
+      const toolName = (msg.tool_call_id ? toolNameMap.get(msg.tool_call_id) : undefined) || msg.tool_call_id || "tool_result";
+      const funcResponse: Record<string, unknown> = {
+        name: toolName,
+        response: parsedOutput
+      };
+      // CRITICAL for Claude and Gemini on Cloud Code Assist: include tool call ID
+      if (msg.tool_call_id) {
+        funcResponse.id = msg.tool_call_id;
+      }
+
+      // Merge consecutive tool responses in the same turn into a single user turn with multiple parts
+      const lastContent = contents[contents.length - 1];
+      if (lastContent && lastContent.role === "user" && lastContent.parts.some(p => p.functionResponse)) {
+        lastContent.parts.push({ functionResponse: funcResponse });
+      } else {
+        contents.push({
+          role: "user",
+          parts: [{ functionResponse: funcResponse }]
+        });
+      }
     }
   }
 
@@ -233,15 +269,17 @@ export function buildAntigravityRequestBody(
   }
 
   const isClaude = upstreamModelId.startsWith("claude-");
-  const isGemini3 = upstreamModelId.includes("gemini-3");
+  const isGemini3 = isGemini3Family(upstreamModelId);
 
   if (isGemini3) {
-    let level = thinkingOverride?.thinkingLevel;
-    if (!level && request.reasoning_effort) {
-      if (request.reasoning_effort === "minimal") level = "minimal";
-      else if (request.reasoning_effort === "low") level = "low";
-      else if (request.reasoning_effort === "medium") level = "medium";
-      else if (request.reasoning_effort === "high" || request.reasoning_effort === "xhigh" || request.reasoning_effort === "max") level = "high";
+    let level = request.reasoning_effort || thinkingOverride?.thinkingLevel;
+    if (level === "minimal") {
+      // On Gemini 3.7+ (including 3.8), Google CCA returns 400 for MINIMAL. Clamp to low.
+      if (upstreamModelId.includes("3.7") || upstreamModelId.includes("3.8") || !upstreamModelId.includes("3.6")) {
+        level = "low";
+      }
+    } else if (level === "xhigh" || level === "max") {
+      level = "high";
     }
     generationConfig.thinkingConfig = {
       thinkingLevel: level || "low"
@@ -281,11 +319,29 @@ export function buildAntigravityRequestBody(
 
   if (tools.length > 0) {
     innerRequest.tools = tools;
-    innerRequest.toolConfig = {
-      functionCallingConfig: {
-        mode: "VALIDATED"
+    let mode: "AUTO" | "ANY" | "NONE" | "VALIDATED" = "VALIDATED";
+    let allowedFunctionNames: string[] | undefined = undefined;
+
+    if (request.tool_choice === "none") {
+      mode = "NONE";
+    } else if (request.tool_choice === "required") {
+      mode = "ANY";
+    } else if (request.tool_choice === "auto") {
+      mode = "AUTO";
+    } else if (typeof request.tool_choice === "object" && request.tool_choice !== null) {
+      const tc = request.tool_choice as { function?: { name?: string } };
+      if (tc.function?.name) {
+        mode = "ANY";
+        allowedFunctionNames = [tc.function.name];
       }
-    };
+    }
+
+    const functionCallingConfig: Record<string, unknown> = { mode };
+    if (allowedFunctionNames && allowedFunctionNames.length > 0) {
+      functionCallingConfig.allowedFunctionNames = allowedFunctionNames;
+    }
+
+    innerRequest.toolConfig = { functionCallingConfig };
   }
 
   return {

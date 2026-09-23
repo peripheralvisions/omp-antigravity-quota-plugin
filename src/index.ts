@@ -57,6 +57,14 @@ export default async function antigravityPlugin(pi: ExtensionAPI) {
     console.warn("[Antigravity Plugin] Failed to fetch remote models during load, using fallback catalog.", err);
   }
 
+  accountManager.setOnPeriodicPoll(async () => {
+    try {
+      const fresh = await fetchRemoteModels(accountManager, DEFAULT_CONFIG);
+      proxy.setModels(fresh);
+      accountManager.syncOAuthToOmp();
+    } catch {}
+  });
+
   // Register provider into oh-my-pi's model registry
   pi.registerProvider("antigravity", {
     baseUrl: proxy.getBaseUrl(),
@@ -214,6 +222,7 @@ export default async function antigravityPlugin(pi: ExtensionAPI) {
         await accountManager.syncAllQuotas(true);
         const fresh = await fetchRemoteModels(accountManager, DEFAULT_CONFIG);
         proxy.setModels(fresh);
+        accountManager.syncOAuthToOmp();
         ctx.ui.notify(`Reloaded ${accountManager.getAccounts().length} accounts and ${fresh.length} models.`, "info");
         return;
       }

@@ -2,7 +2,7 @@ import type { Server } from "bun";
 import type { AccountManager } from "./account-manager.ts";
 import type { AntigravityConfig } from "./types.ts";
 import { buildAntigravityRequestBody, type OpenAIChatRequest } from "./request-transformer.ts";
-import { FALLBACK_MODELS, type ModelProfile } from "./model-catalog.ts";
+import { fetchRemoteModels, FALLBACK_MODELS, type ModelProfile } from "./model-catalog.ts";
 
 export class ProxyServer {
   private server: Server<unknown> | null = null;
@@ -10,6 +10,7 @@ export class ProxyServer {
   private config: AntigravityConfig;
   private port: number;
   private models: ModelProfile[] = FALLBACK_MODELS;
+  private thoughtSignatureCache: Map<string, string> = new Map();
 
   constructor(accountManager: AccountManager, config: AntigravityConfig, port: number = 20129) {
     this.accountManager = accountManager;
@@ -19,6 +20,24 @@ export class ProxyServer {
 
   public setModels(models: ModelProfile[]) {
     this.models = models;
+  }
+
+  public getModels(): ModelProfile[] {
+    return this.models;
+  }
+
+  public async refreshModels(): Promise<ModelProfile[]> {
+    try {
+      const fresh = await fetchRemoteModels(this.accountManager, this.config);
+      this.models = fresh;
+      return fresh;
+    } catch {
+      return this.models;
+    }
+  }
+
+  public getThoughtSignature(callId: string): string | undefined {
+    return this.thoughtSignatureCache.get(callId);
   }
 
   public getBaseUrl(): string {
@@ -93,7 +112,7 @@ export class ProxyServer {
 
             // Health check
             if (url.pathname === "/health" || url.pathname === "/") {
-              return new Response(JSON.stringify({ status: "ok", provider: "antigravity-proxy" }), {
+              return new Response(JSON.stringify({ status: "ok", provider: "antigravity-proxy", modelCount: this.models.length }), {
                 headers: { ...corsHeaders, "Content-Type": "application/json" }
               });
             }
@@ -101,6 +120,9 @@ export class ProxyServer {
             return new Response("Not Found", { status: 404, headers: corsHeaders });
           }
         });
+
+        // Unref server so it doesn't hold short-lived CLI processes open (e.g. omp models)
+        this.server.unref();
 
         this.port = attemptPort;
         bound = true;
@@ -129,15 +151,58 @@ export class ProxyServer {
     corsHeaders: Record<string, string>
   ): Promise<Response> {
     const rawModelId = request.model.replace(/^ag\//, "").replace(/^google-antigravity\//, "");
-    const profile = this.models.find(m => m.id === rawModelId || m.id === request.model) || {
+    let profile = this.models.find(m => m.id === rawModelId || m.id === request.model);
+
+    // If model is unknown, trigger an on-demand refresh in case Google released it
+    if (!profile) {
+      await this.refreshModels();
+      profile = this.models.find(m => m.id === rawModelId || m.id === request.model);
+    }
+
+    let upstreamModelId = profile?.upstreamModelId || rawModelId;
+    let thinkingLevel = profile?.thinkingLevel;
+
+    // Dynamic Flash generation fallback: map gemini-X.Y-flash(-tier) to gemini-X.Y-flash-tiered
+    const flashMatch = rawModelId.match(/^gemini-(\d+(?:\.\d+)?)-flash(?:-(high|medium|low))?$/i);
+    if (flashMatch && flashMatch[1] !== "3.5") {
+      const ver = flashMatch[1];
+      const tier = flashMatch[2]?.toLowerCase();
+      upstreamModelId = `gemini-${ver}-flash-tiered`;
+      if (tier === "high") thinkingLevel = "high";
+      else if (tier === "medium") thinkingLevel = "medium";
+      else if (tier === "low") thinkingLevel = "low";
+    }
+
+    // Dynamic Gemini 3.5 Flash routing
+    const requestedEffort = request.reasoning_effort;
+    if (rawModelId === "gemini-3.5-flash") {
+      if (requestedEffort === "high") {
+        upstreamModelId = "gemini-3-flash-agent";
+      } else if (requestedEffort === "medium") {
+        upstreamModelId = "gemini-3.5-flash-low";
+      } else {
+        upstreamModelId = "gemini-3.5-flash-extra-low";
+      }
+    } else if (rawModelId === "gemini-3.1-pro") {
+      if (requestedEffort === "high" || requestedEffort === "medium") {
+        upstreamModelId = "gemini-pro-agent";
+      } else {
+        upstreamModelId = "gemini-3.1-pro-low";
+      }
+    } else if (rawModelId === "gemini-3.1-pro-high") {
+      upstreamModelId = "gemini-pro-agent";
+    }
+
+    const resolvedProfile = profile || {
       id: rawModelId,
       name: rawModelId,
-      upstreamModelId: rawModelId,
+      upstreamModelId,
       contextWindow: 1_048_576,
       maxOutputTokens: 65_536,
       supportsImages: true,
       supportsThinking: true,
-      supportsTools: true
+      supportsTools: true,
+      thinkingLevel
     };
 
     const maxRetries = 3;
@@ -146,7 +211,7 @@ export class ProxyServer {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       let account;
       try {
-        account = await this.accountManager.getValidAccount(profile.upstreamModelId);
+        account = await this.accountManager.getValidAccount(upstreamModelId);
       } catch (err) {
         return new Response(
           JSON.stringify({
@@ -159,10 +224,16 @@ export class ProxyServer {
         );
       }
 
-      const thinkingOverride = profile.thinkingLevel ? { thinkingLevel: profile.thinkingLevel } : undefined;
-      const upstreamBody = buildAntigravityRequestBody(account, profile.upstreamModelId, request, thinkingOverride);
+      const thinkingOverride = thinkingLevel ? { thinkingLevel } : undefined;
+      const upstreamBody = buildAntigravityRequestBody(
+        account,
+        upstreamModelId,
+        request,
+        thinkingOverride,
+        callId => this.thoughtSignatureCache.get(callId)
+      );
 
-      const isClaude = profile.upstreamModelId.startsWith("claude-");
+      const isClaude = upstreamModelId.startsWith("claude-");
       const headers: Record<string, string> = {
         Authorization: `Bearer ${account.accessToken}`,
         "Content-Type": "application/json",
@@ -196,7 +267,7 @@ export class ProxyServer {
           throw new Error(`Upstream error ${upstreamRes.status}: ${errText}`);
         }
 
-        return this.createOpenAISseStreamResponse(upstreamRes, profile.id, corsHeaders);
+        return this.createOpenAISseStreamResponse(upstreamRes, resolvedProfile.id, corsHeaders);
       } catch (err) {
         lastError = err as Error;
         console.error(`[Antigravity Proxy] Attempt ${attempt + 1} failed:`, err);
@@ -229,12 +300,14 @@ export class ProxyServer {
 
     const streamId = "chatcmpl-" + Math.random().toString(36).substring(2, 15);
     const created = Math.floor(Date.now() / 1000);
+    const self = this;
 
     const transformStream = new ReadableStream({
       async start(controller) {
         const reader = upstreamBody.getReader();
         let buffer = "";
         let toolCallIndex = 0;
+        let hasToolCalls = false;
         const initialChunk = {
           id: streamId,
           object: "chat.completion.chunk",
@@ -314,9 +387,11 @@ export class ProxyServer {
                     }
 
                     if (part.functionCall) {
+                      hasToolCalls = true;
+                      const callId = part.functionCall.id || "call_" + Math.random().toString(36).substring(2, 9);
                       const toolCallDelta: Record<string, unknown> = {
                         index: toolCallIndex++,
-                        id: part.functionCall.id || "call_" + Math.random().toString(36).substring(2, 9),
+                        id: callId,
                         type: "function",
                         function: {
                           name: part.functionCall.name,
@@ -324,16 +399,18 @@ export class ProxyServer {
                         }
                       };
 
-                      // Preserve thought signature in tool call chunk for subsequent turns (both direct & pi-ai extra_content)
+                      // Preserve thought signature in cache and in delta chunks
                       const sig = part.thoughtSignature || part.thought_signature;
                       if (typeof sig === "string" && sig) {
+                        self.thoughtSignatureCache.set(callId, sig);
                         toolCallDelta.thought_signature = sig;
+                        toolCallDelta.thoughtSignature = sig;
                         toolCallDelta.extra_content = {
-                          google: {
-                            thought_signature: sig
-                          }
+                          google: { thought_signature: sig },
+                          vertex: { thought_signature: sig }
                         };
                       }
+
                       const toolCallChunk = {
                         id: streamId,
                         object: "chat.completion.chunk",
@@ -355,7 +432,10 @@ export class ProxyServer {
                 }
 
                 if (candidate?.finishReason) {
-                  const finishReason = candidate.finishReason === "STOP" ? "stop" : candidate.finishReason.toLowerCase();
+                  let finishReason = candidate.finishReason === "STOP" ? "stop" : candidate.finishReason.toLowerCase();
+                  if (hasToolCalls) {
+                    finishReason = "tool_calls";
+                  }
                   const finalChunk = {
                     id: streamId,
                     object: "chat.completion.chunk",
