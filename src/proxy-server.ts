@@ -234,7 +234,7 @@ export class ProxyServer {
       async start(controller) {
         const reader = upstreamBody.getReader();
         let buffer = "";
-
+        let toolCallIndex = 0;
         const initialChunk = {
           id: streamId,
           object: "chat.completion.chunk",
@@ -275,6 +275,7 @@ export class ProxyServer {
                           text?: string;
                           thought?: boolean;
                           thoughtSignature?: string;
+                          thought_signature?: string;
                           functionCall?: {
                             id?: string;
                             name: string;
@@ -314,7 +315,7 @@ export class ProxyServer {
 
                     if (part.functionCall) {
                       const toolCallDelta: Record<string, unknown> = {
-                        index: 0,
+                        index: toolCallIndex++,
                         id: part.functionCall.id || "call_" + Math.random().toString(36).substring(2, 9),
                         type: "function",
                         function: {
@@ -323,11 +324,16 @@ export class ProxyServer {
                         }
                       };
 
-                      // Preserve thought signature in tool call chunk for subsequent turns
-                      if (part.thoughtSignature) {
-                        toolCallDelta.thought_signature = part.thoughtSignature;
+                      // Preserve thought signature in tool call chunk for subsequent turns (both direct & pi-ai extra_content)
+                      const sig = part.thoughtSignature || part.thought_signature;
+                      if (typeof sig === "string" && sig) {
+                        toolCallDelta.thought_signature = sig;
+                        toolCallDelta.extra_content = {
+                          google: {
+                            thought_signature: sig
+                          }
+                        };
                       }
-
                       const toolCallChunk = {
                         id: streamId,
                         object: "chat.completion.chunk",

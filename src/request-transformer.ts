@@ -12,7 +12,13 @@ export interface OpenAIMessage {
       arguments: string;
     };
     thought_signature?: string;
+    thoughtSignature?: string;
+    extra_content?: {
+      google?: { thought_signature?: string };
+      vertex?: { thought_signature?: string };
+    };
   }>;
+  reasoning_details?: unknown[];
   tool_call_id?: string;
 }
 
@@ -46,9 +52,71 @@ export function cleanJsonSchema(schema: unknown): unknown {
   }
 }
 
-// Fallback dummy thought signature if caller omitted it for a Gemini 3 tool call turn
-const DUMMY_THOUGHT_SIGNATURE = "ErUBEqIBCl8U/gR5H5E6L6w3W+1fR0R2D4s9G+hL6Q6p1kG6N8pD3L+2v6D6k8kE3m4W8N3w/gR5H5E6L6w3W+1fR0R2D4s9G+hL6Q6p1kG6N8pD3L+2v6D6k8kE3m4W8N3w/gR5H5E6L6w3W+1fR0R2D4s9G+hL6Q6p1kG6N8pD3L+2v6D6k8kE3m4W8N3w==";
+// Cloud Code Assist bypass sentinel for Gemini 3 tool call replay when thought signature is absent
+export const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
+const base64SignaturePattern = /^[A-Za-z0-9+/_-]+={0,2}$/;
+
+export function isValidThoughtSignature(signature: unknown): signature is string {
+  if (typeof signature !== "string" || !signature.trim()) return false;
+  const trimmed = signature.trim();
+  if (trimmed === SKIP_THOUGHT_SIGNATURE) return true;
+  if (trimmed.length % 4 !== 0) return false;
+  return base64SignaturePattern.test(trimmed);
+}
+
+export function extractThoughtSignature(
+  tc: NonNullable<OpenAIMessage["tool_calls"]>[number],
+  msg?: OpenAIMessage
+): string | undefined {
+  if (isValidThoughtSignature(tc.thought_signature)) {
+    return tc.thought_signature.trim();
+  }
+  if (isValidThoughtSignature(tc.thoughtSignature)) {
+    return tc.thoughtSignature.trim();
+  }
+
+  // pi-ai / oh-my-pi OpenAI-completions dialect:
+  // replayedToolCall.extra_content = { google: { thought_signature: "..." } }
+  if (tc.extra_content && typeof tc.extra_content === "object") {
+    for (const ns of ["google", "vertex"] as const) {
+      const providerContent = tc.extra_content[ns];
+      if (providerContent && typeof providerContent === "object") {
+        const sig = providerContent.thought_signature;
+        if (isValidThoughtSignature(sig)) {
+          return sig.trim();
+        }
+      }
+    }
+  }
+
+  // Check reasoning_details on the assistant message if present
+  if (msg && Array.isArray(msg.reasoning_details)) {
+    for (const detail of msg.reasoning_details) {
+      if (detail && typeof detail === "object") {
+        const d = detail as Record<string, unknown>;
+        if (
+          d.type === "reasoning.encrypted" &&
+          (d.id === tc.id || !tc.id) &&
+          isValidThoughtSignature(d.data)
+        ) {
+          return (d.data as string).trim();
+        }
+        for (const ns of ["google", "vertex"] as const) {
+          const g = d[ns];
+          if (g && typeof g === "object") {
+            const sig = (g as Record<string, unknown>).thought_signature;
+            if (isValidThoughtSignature(sig)) {
+              return (sig as string).trim();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
 export function buildAntigravityRequestBody(
   account: AntigravityAccount,
   upstreamModelId: string,
@@ -119,10 +187,11 @@ export function buildAntigravityRequestBody(
           };
 
           // Google CCA requires thought_signature for replayed function calls on Gemini 3+
-          if (tc.thought_signature) {
-            part.thoughtSignature = tc.thought_signature;
+          const sig = extractThoughtSignature(tc, msg);
+          if (sig) {
+            part.thoughtSignature = sig;
           } else if (upstreamModelId.includes("gemini-3")) {
-            part.thoughtSignature = DUMMY_THOUGHT_SIGNATURE;
+            part.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
           }
 
           parts.push(part);

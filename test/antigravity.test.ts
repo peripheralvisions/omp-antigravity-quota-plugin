@@ -1,7 +1,13 @@
 import { describe, it, expect } from "bun:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { AccountManager, getModelCategory } from "../src/account-manager.ts";
-import { cleanJsonSchema, buildAntigravityRequestBody } from "../src/request-transformer.ts";
+import {
+  cleanJsonSchema,
+  buildAntigravityRequestBody,
+  isValidThoughtSignature,
+  extractThoughtSignature,
+  SKIP_THOUGHT_SIGNATURE
+} from "../src/request-transformer.ts";
 import { fetchRemoteModels } from "../src/model-catalog.ts";
 import { ProxyServer } from "../src/proxy-server.ts";
 import fs from "node:fs";
@@ -173,6 +179,89 @@ describe("RequestTransformer", () => {
     expect(inner.tools).toBeDefined();
     expect(inner.toolConfig).toBeDefined();
     expect((inner.generationConfig as Record<string, unknown>).thinkingConfig).toBeDefined();
+  });
+
+  it("handles thought signature extraction and fallback sentinel on tool replay", () => {
+    const account = {
+      id: "test",
+      email: "test@example.com",
+      name: "Test",
+      projectId: "aicode-consumers",
+      accessToken: "token",
+      refreshToken: "refresh",
+      expiresAt: Date.now() + 100000,
+      priority: 1,
+      isActive: true
+    };
+
+    // 1. Validation checks
+    expect(isValidThoughtSignature(SKIP_THOUGHT_SIGNATURE)).toBe(true);
+    expect(isValidThoughtSignature("ErUBEqIBCl8U/gR5H5E6L6w3W+1fR0R2D4s9G+hL6Q6p1kG6N8pD3L+2v6D6k8kE3m4W8N3w==")).toBe(false); // bad length % 4
+    expect(isValidThoughtSignature("EoUCCoICAWkUfROV1rJc+xh7PXC6BLYDbCVuiFI9Z/Phdv+oO3/1zI9qVv1n9r+7piqe/FvLF9I0yjxz4tsctR4j8AsR043qoeTIvBjl9HVPH09MrYPXVtHf3wK6pfEE8R+GGY844a/kkrvtLno5bjePfokUzkva3voD6KdQQjDYPSF+YHzgefDCoEwXYysVK/+kTwBQ/jW0JwnztOwDa+7YoWRk6MogjjeTwFai+GVQIgGj/Td/vhxH1z2eIuOu9zvqLKQjlo1yjW7Vyw+oXJl7y/8ugs9gXOizIxGCeRDuqWHZPmuCFxYTuXBXPgc48STFpsza5DSU7biZgvggoGQ/lDBKysmq")).toBe(true);
+
+    // 2. Extra content extraction (pi-ai dialect)
+    const extractedFromExtra = extractThoughtSignature({
+      id: "call_1",
+      type: "function",
+      function: { name: "test", arguments: "{}" },
+      extra_content: {
+        google: {
+          thought_signature: "AABBCCDD"
+        }
+      }
+    });
+    expect(extractedFromExtra).toBe("AABBCCDD");
+
+    // 3. Fallback to SKIP_THOUGHT_SIGNATURE when omitted on Gemini 3
+    const reqMissing = buildAntigravityRequestBody(
+      account,
+      "gemini-3.8-flash-tiered",
+      {
+        model: "gemini-3.8-flash-low",
+        messages: [
+          { role: "user", content: "test" },
+          {
+            role: "assistant",
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: { name: "test", arguments: "{}" }
+              }
+            ]
+          },
+          { role: "tool", tool_call_id: "call_1", content: "{}" }
+        ]
+      }
+    );
+    const innerMissing = reqMissing.request as { contents: Array<{ parts: Array<Record<string, unknown>> }> };
+    expect(innerMissing.contents[1].parts[0].thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
+
+    // 4. Invalid base64 in tool call gets replaced with sentinel instead of crashing upstream
+    const reqInvalid = buildAntigravityRequestBody(
+      account,
+      "gemini-3.8-flash-tiered",
+      {
+        model: "gemini-3.8-flash-low",
+        messages: [
+          { role: "user", content: "test" },
+          {
+            role: "assistant",
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: { name: "test", arguments: "{}" },
+                thought_signature: "ErUBEqIBCl8U/gR5H5E6L6w3W+1fR0R2D4s9G+hL6Q6p1kG6N8pD3L+2v6D6k8kE3m4W8N3w=="
+              }
+            ]
+          },
+          { role: "tool", tool_call_id: "call_1", content: "{}" }
+        ]
+      }
+    );
+    const innerInvalid = reqInvalid.request as { contents: Array<{ parts: Array<Record<string, unknown>> }> };
+    expect(innerInvalid.contents[1].parts[0].thoughtSignature).toBe(SKIP_THOUGHT_SIGNATURE);
   });
 });
 
