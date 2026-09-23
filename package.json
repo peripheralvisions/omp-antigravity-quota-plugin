@@ -1,0 +1,20 @@
+{
+  "name": "omp-plugin-antigravity",
+  "version": "1.0.0",
+  "description": "Multi-account Google Antigravity proxy and provider for oh-my-pi",
+  "main": "src/index.ts",
+  "type": "module",
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "workspace:*",
+    "@types/bun": "latest",
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {}
+}
